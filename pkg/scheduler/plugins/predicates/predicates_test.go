@@ -404,9 +404,12 @@ func TestPodAntiAffinity(t *testing.T) {
 
 func TestSetUpDynamicResourcesArgs_Default(t *testing.T) {
 	dra := defaultDynamicResourcesArgs()
-	setUpDynamicResourcesArgs(dra, nil)
+	if err := setUpDynamicResourcesArgs(dra, nil); err != nil {
+		t.Fatalf("setUpDynamicResourcesArgs returned an error: %v", err)
+	}
 
 	assert.Equal(t, &metav1.Duration{Duration: defaultDRAFilterTimeout}, dra.FilterTimeout)
+	assert.Equal(t, defaultDRAScoreWeight, dra.Weight)
 }
 
 func TestSetUpDynamicResourcesArgs_OverideSeconds(t *testing.T) {
@@ -435,8 +438,75 @@ func TestSetUpDynamicResourcesArgs_OverideSeconds(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dra := defaultDynamicResourcesArgs()
-			setUpDynamicResourcesArgs(dra, tt.rawArgs)
+			if err := setUpDynamicResourcesArgs(dra, tt.rawArgs); err != nil {
+				t.Fatalf("setUpDynamicResourcesArgs returned an error: %v", err)
+			}
 			assert.Equal(t, &metav1.Duration{Duration: tt.expectedDur}, dra.FilterTimeout)
+			assert.Equal(t, defaultDRAScoreWeight, dra.Weight)
+		})
+	}
+}
+
+func TestSetUpDynamicResourcesArgs_ScoreWeight(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawArgs    framework.Arguments
+		wantWeight int
+		wantErr    bool
+	}{
+		{
+			name:       "missing key keeps default",
+			rawArgs:    framework.Arguments{},
+			wantWeight: defaultDRAScoreWeight,
+		},
+		{
+			name:       "int weight",
+			rawArgs:    framework.Arguments{draScoreWeightKey: 4},
+			wantWeight: 4,
+		},
+		{
+			name:       "yaml float64 weight",
+			rawArgs:    framework.Arguments{draScoreWeightKey: float64(2)},
+			wantWeight: 2,
+		},
+		{
+			name:       "zero disables score",
+			rawArgs:    framework.Arguments{draScoreWeightKey: 0},
+			wantWeight: 0,
+		},
+		{
+			name:    "negative int is rejected",
+			rawArgs: framework.Arguments{draScoreWeightKey: -1},
+			wantErr: true,
+		},
+		{
+			name:    "negative float64 is rejected",
+			rawArgs: framework.Arguments{draScoreWeightKey: float64(-2)},
+			wantErr: true,
+		},
+		{
+			name:    "fractional float64 is rejected",
+			rawArgs: framework.Arguments{draScoreWeightKey: 1.5},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dra := defaultDynamicResourcesArgs()
+			err := setUpDynamicResourcesArgs(dra, tt.rawArgs)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected weight error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("setUpDynamicResourcesArgs returned an error: %v", err)
+			}
+			if dra.Weight != tt.wantWeight {
+				t.Fatalf("expected weight %d, got %d", tt.wantWeight, dra.Weight)
+			}
 		})
 	}
 }

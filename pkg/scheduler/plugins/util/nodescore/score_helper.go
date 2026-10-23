@@ -28,6 +28,10 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
+// BaseScorePlugin is the scoring surface shared by Volcano callers.
+// PreScore is optional. Callers invoke RunPreScorePlugin only when the concrete
+// plugin also implements fwk.PreScorePlugin. Kubernetes DynamicResources
+// implements ScorePlugin and ScoreExtensions without PreScore.
 type BaseScorePlugin interface {
 	fwk.ScorePlugin
 }
@@ -100,6 +104,9 @@ func CalculatePluginScore(
 	default:
 	}
 
+	// ScoreExtensions() is nil when the plugin has no normalizer. A nil status
+	// from NormalizeScore is success, matching kube-scheduler. DynamicResources
+	// returns nil when the plugin itself is disabled.
 	if extensions := plugin.ScoreExtensions(); extensions != nil {
 		normalizeStatus := extensions.NormalizeScore(context.TODO(), cycleState, pod, nodeScoreList)
 		if !normalizeStatus.IsSuccess() {
