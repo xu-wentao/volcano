@@ -30,9 +30,10 @@ import (
 )
 
 type fakeScorePlugin struct {
-	name       string
-	scores     map[string]int64
-	extensions *fakeScoreExtensions
+	name        string
+	scores      map[string]int64
+	scoreStatus *fwk.Status
+	extensions  *fakeScoreExtensions
 }
 
 func (p *fakeScorePlugin) Name() string {
@@ -40,6 +41,9 @@ func (p *fakeScorePlugin) Name() string {
 }
 
 func (p *fakeScorePlugin) Score(_ context.Context, _ fwk.CycleState, _ *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
+	if p.scoreStatus != nil {
+		return 0, p.scoreStatus
+	}
 	return p.scores[nodeInfo.Node().Name], nil
 }
 
@@ -156,6 +160,113 @@ func TestCalculatePluginScore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCalculatePluginScoreHonorsNilStatusAndScoreRange(t *testing.T) {
+	nodeInfos := testNodeInfos("node-a")
+
+	t.Run("nil score status is success", func(t *testing.T) {
+		plugin := &fakeScorePlugin{
+			name:   "nil-status",
+			scores: map[string]int64{"node-a": fwk.MaxNodeScore},
+		}
+		scores, err := CalculatePluginScore(plugin.Name(), plugin, k8sframework.NewCycleState(), &v1.Pod{}, nodeInfos, 3)
+		if err != nil {
+			t.Fatalf("CalculatePluginScore returned an error: %v", err)
+		}
+		if scores["node-a"] != float64(fwk.MaxNodeScore*3) {
+			t.Fatalf("expected weighted score %d, got %v", fwk.MaxNodeScore*3, scores["node-a"])
+		}
+	})
+
+	t.Run("nil normalize status is success", func(t *testing.T) {
+		plugin := &fakeScorePlugin{
+			name:       "nil-normalize",
+			scores:     map[string]int64{"node-a": 10},
+			extensions: &fakeScoreExtensions{},
+		}
+		scores, err := CalculatePluginScore(plugin.Name(), plugin, k8sframework.NewCycleState(), &v1.Pod{}, nodeInfos, 1)
+		if err != nil {
+			t.Fatalf("CalculatePluginScore returned an error: %v", err)
+		}
+		if scores["node-a"] != 10 {
+			t.Fatalf("expected score 10, got %v", scores["node-a"])
+		}
+	})
+
+	t.Run("raw score above max fails before weight", func(t *testing.T) {
+		plugin := &fakeScorePlugin{
+			name:   "too-high",
+			scores: map[string]int64{"node-a": fwk.MaxNodeScore + 1},
+		}
+		_, err := CalculatePluginScore(plugin.Name(), plugin, k8sframework.NewCycleState(), &v1.Pod{}, nodeInfos, 1)
+		if err == nil || !strings.Contains(err.Error(), "invalid score") {
+			t.Fatalf("expected invalid score error, got %v", err)
+		}
+	})
+
+	t.Run("normalized score below min fails", func(t *testing.T) {
+		plugin := &fakeScorePlugin{
+			name:   "too-low",
+			scores: map[string]int64{"node-a": 1},
+			extensions: &fakeScoreExtensions{
+				normalize: func(scores fwk.NodeScoreList) {
+					scores[0].Score = fwk.MinNodeScore - 1
+				},
+			},
+		}
+		_, err := CalculatePluginScore(plugin.Name(), plugin, k8sframework.NewCycleState(), &v1.Pod{}, nodeInfos, 1)
+		if err == nil || !strings.Contains(err.Error(), "invalid score") {
+			t.Fatalf("expected invalid score error, got %v", err)
+		}
+	})
+}
+
+func TestCalculatePluginScoreReturnsScoreError(t *testing.T) {
+	plugin := &fakeScorePlugin{
+		name:        "failing-score",
+		scoreStatus: fwk.NewStatus(fwk.Error, "score failed"),
+	}
+	_, err := CalculatePluginScore(plugin.Name(), plugin, k8sframework.NewCycleState(), &v1.Pod{}, testNodeInfos("node-a"), 1)
+	if err == nil || !strings.Contains(err.Error(), "score failed") {
+		t.Fatalf("expected score error, got %v", err)
+	}
+}
+
+func TestRunPreScorePlugin(t *testing.T) {
+	plugin := &preScoreAwarePlugin{}
+	skip, err := RunPreScorePlugin(plugin, k8sframework.NewCycleState(), &v1.Pod{}, nil)
+	if err != nil || skip {
+		t.Fatalf("expected success without skip, got skip=%t err=%v", skip, err)
+	}
+
+	plugin.status = fwk.NewStatus(fwk.Skip)
+	skip, err = RunPreScorePlugin(plugin, k8sframework.NewCycleState(), &v1.Pod{}, nil)
+	if err != nil || !skip {
+		t.Fatalf("expected skip, got skip=%t err=%v", skip, err)
+	}
+
+	plugin.status = fwk.NewStatus(fwk.Error, "pre-score failed")
+	_, err = RunPreScorePlugin(plugin, k8sframework.NewCycleState(), &v1.Pod{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "pre-score failed") {
+		t.Fatalf("expected pre-score error, got %v", err)
+	}
+
+	plugin.status = nil
+	skip, err = RunPreScorePlugin(plugin, k8sframework.NewCycleState(), &v1.Pod{}, nil)
+	if err != nil || skip {
+		t.Fatalf("nil status should be success, got skip=%t err=%v", skip, err)
+	}
+}
+
+type preScoreAwarePlugin struct {
+	status *fwk.Status
+}
+
+func (p *preScoreAwarePlugin) Name() string { return "pre-score" }
+
+func (p *preScoreAwarePlugin) PreScore(context.Context, fwk.CycleState, *v1.Pod, []fwk.NodeInfo) *fwk.Status {
+	return p.status
 }
 
 func TestCalculatePluginScoreReturnsNormalizeError(t *testing.T) {

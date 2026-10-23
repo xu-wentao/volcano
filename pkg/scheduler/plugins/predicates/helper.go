@@ -17,6 +17,8 @@ limitations under the License.
 package predicates
 
 import (
+	"fmt"
+	"math"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,7 +35,9 @@ const (
 	volumeBindingWeightKey         = "volumebinding.weight"
 	defaultBindTimeoutSeconds      = 600
 	draFilterTimeoutSecondsKey     = "dynamicresources.filterTimeoutSeconds"
+	draScoreWeightKey              = "dynamicresources.weight"
 	defaultDRAFilterTimeout        = 10 * time.Second
+	defaultDRAScoreWeight          = 1
 )
 
 type wrapVolumeBindingArgs struct {
@@ -42,6 +46,9 @@ type wrapVolumeBindingArgs struct {
 }
 
 type wrapDynamicResourcesArgs struct {
+	// Weight scales the native DynamicResources score. Zero disables that
+	// score only. Filter, Reserve and PreBind keep running.
+	Weight int
 	*kubeschedulerconfig.DynamicResourcesArgs
 }
 
@@ -110,24 +117,78 @@ func setUpVolumeBindingArgs(vbArgs *wrapVolumeBindingArgs, rawArgs framework.Arg
 
 func defaultDynamicResourcesArgs() *wrapDynamicResourcesArgs {
 	return &wrapDynamicResourcesArgs{
+		Weight: defaultDRAScoreWeight,
 		DynamicResourcesArgs: &kubeschedulerconfig.DynamicResourcesArgs{
 			FilterTimeout: &metav1.Duration{Duration: defaultDRAFilterTimeout},
 		},
 	}
 }
 
-// setUp DynamicResourcesArg populates args from volcano framework arguments.
+// setUpDynamicResourcesArgs populates args from volcano framework arguments.
 //
-//	Supported override:
+//	Supported overrides:
 //	 - dynamicresources.filterTimeoutSeconds: integer seconds (e.g., 15)
-func setUpDynamicResourcesArgs(dra *wrapDynamicResourcesArgs, rawArgs framework.Arguments) {
+//	 - dynamicresources.weight: integer >= 0 (default 1). Zero disables DRA
+//	   Score only. A negative value is rejected and must not be treated as spread.
+//
+// Scheduler YAML decodes numbers into float64, so both int and whole-number
+// float64 are accepted.
+func setUpDynamicResourcesArgs(dra *wrapDynamicResourcesArgs, rawArgs framework.Arguments) error {
+	weight, err := dynamicResourcesScoreWeight(rawArgs)
+	if err != nil {
+		return err
+	}
+	dra.Weight = weight
 	if rawArgs == nil {
-		return
+		return nil
 	}
 
 	if secs, ok := framework.Get[int](rawArgs, draFilterTimeoutSecondsKey); ok {
 		if secs >= 0 {
 			dra.FilterTimeout = &metav1.Duration{Duration: time.Duration(secs) * time.Second}
 		}
+	}
+	return nil
+}
+
+func dynamicResourcesScoreWeight(rawArgs framework.Arguments) (int, error) {
+	if rawArgs == nil {
+		return defaultDRAScoreWeight, nil
+	}
+	raw, ok := rawArgs[draScoreWeightKey]
+	if !ok {
+		return defaultDRAScoreWeight, nil
+	}
+	weight, err := intArgument(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", draScoreWeightKey, err)
+	}
+	if weight < 0 {
+		return 0, fmt.Errorf("invalid %s: %d, must be >= 0", draScoreWeightKey, weight)
+	}
+	return weight, nil
+}
+
+func intArgument(raw interface{}) (int, error) {
+	switch value := raw.(type) {
+	case int:
+		return value, nil
+	case int32:
+		return int(value), nil
+	case int64:
+		if value > int64(math.MaxInt) || value < int64(math.MinInt) {
+			return 0, fmt.Errorf("integer %d overflows", value)
+		}
+		return int(value), nil
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) || value != math.Trunc(value) {
+			return 0, fmt.Errorf("%v is not an integer", value)
+		}
+		if value > float64(math.MaxInt) || value < float64(math.MinInt) {
+			return 0, fmt.Errorf("%v overflows int", value)
+		}
+		return int(value), nil
+	default:
+		return 0, fmt.Errorf("type %T is not an integer", raw)
 	}
 }
