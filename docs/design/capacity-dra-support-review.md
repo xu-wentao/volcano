@@ -1,615 +1,539 @@
-# Capacity Plugin DRA Support 设计与实现 Review
+# Capacity Plugin DRA Support Design and Implementation Review
 
-> 本文只审查 capacity plugin 的 queue quota。它不是 DRA 节点打分或设备利用率
-> binpack 的实现说明。打分设计见 [dra-score-design.md](./dra-score-design.md)。
-> 本文列出的 quota 修正不在 DRA score 变更里实现。
+> This review covers only the capacity plugin's queue quota. It is not the design for DRA node scoring or device-utilization binpack. Scoring is described in [dra-score-design.md](./dra-score-design.md). The quota fixes listed here are not implemented by the DRA score change.
 
-## 1. Review 范围
+## Review Scope
 
-本文审查以下内容：
+This review covers:
 
 - `docs/design/capacity-dra-support.md`
-- DRA 请求摘要生成：
+- DRA request summary generation:
   - `pkg/scheduler/cache/cache.go`
   - `pkg/scheduler/cache/event_handlers.go`
   - `pkg/scheduler/api/job_info.go`
-- capacity plugin 的 queue admission、allocation、层级队列和共享 Claim 记账：
+- Queue admission, allocation, hierarchical queues, and shared Claim accounting in the capacity plugin:
   - `pkg/scheduler/plugins/capacity/capacity.go`
-- Queue `status.allocated` 的 DRA 展示：
+- DRA display in Queue `status.allocated`:
   - `pkg/scheduler/framework/session.go`
   - `pkg/scheduler/framework/session_dra_queue_status.go`
-- 单元测试和 E2E：
+- Unit tests and e2e:
   - `pkg/scheduler/cache/cache_dra_test.go`
   - `pkg/scheduler/plugins/capacity/capacity_test.go`
   - `pkg/scheduler/framework/session_dra_queue_status_test.go`
   - `test/e2e/dra/dra_quota_test.go`
-- Kubernetes v1.36.1 的 DRA API 和 scheduler `DynamicResources` 实现。
+- The Kubernetes v1.36.1 DRA API and the scheduler `DynamicResources` implementation.
 
-本文区分四类结论：
+The review uses four kinds of conclusion:
 
-- **correctness bug**：当前行为会违反已经声明的配额语义；
-- **实现缺口**：设计宣称支持，但代码尚未接入对应 capacity 机制；
-- **设计/契约问题**：必须先明确语义，否则无法判断实现是否正确；
-- **明确限制**：可以接受，但必须显式拒绝或清楚暴露，不能静默放行。
+- **correctness bug**: current behavior violates a quota semantic that has already been stated.
+- **implementation gap**: the design claims support, but the code does not yet connect the corresponding capacity mechanism.
+- **design/contract problem**: the semantic must be made explicit before the implementation can be judged correct.
+- **explicit limitation**: acceptable, but it must be rejected explicitly or exposed clearly. It must not pass silently.
 
-## 2. 总体结论
+## Overall Conclusion
 
-“用 Queue `ResourceList` 表达 DRA 逻辑配额、由 Kubernetes DRA 继续负责物理分配”这个职责划分是合理的；把第一版收窄到按 `DeviceClass` 的 `ExactCount` 硬上限也可以形成可用的最小方案。
+Expressing DRA logical quota in the Queue `ResourceList`, while leaving physical allocation to Kubernetes DRA, is a sound split of responsibility. Narrowing the first version to an `ExactCount` hard limit per `DeviceClass` can also be a usable minimum.
 
-但当前设计文档把实际能力描述得过宽。现有实现还不能兑现以下核心承诺：
+The current design document describes the actual capability too broadly. The existing implementation does not deliver these core promises:
 
-- DRA 与普通资源具有相同的 `capability`、`deserved`、`guarantee` 语义；
-- 所有 DRA 请求都受严格的 queue hard limit 约束；
-- shared `ResourceClaim` 在 admission、allocation、层级祖先队列和 Queue Status 中都只计一次；
-- DRA inqueue 预留能跨 scheduling session 保持；
-- consumable capacity 表示 Kubernetes 实际消耗的 capacity；
-- root queue 的 DRA total 可以自动来自集群状态。
+- DRA has the same `capability`, `deserved`, and `guarantee` semantics as ordinary resources.
+- Every DRA request is constrained by a strict queue hard limit.
+- A shared `ResourceClaim` is counted once in admission, allocation, hierarchical ancestor queues, and Queue Status.
+- A DRA inqueue reservation survives across scheduling sessions.
+- Consumable capacity means the capacity Kubernetes actually consumes.
+- The root queue's DRA total can be derived automatically from cluster state.
 
-当前真正形成闭环的范围更接近：
+The loop that actually closes is closer to this:
 
-> Pod 显式引用 `ResourceClaim` 或 Pod 级 `ResourceClaimTemplate`，Claim 只包含 `Exactly + ExactCount` 请求；按请求中声明的 `DeviceClass` 和原始 capacity 数量，在单个 queue 内对已分配 Task 做硬上限检查，并对同名 Claim 做部分去重。
+> A Pod explicitly references a `ResourceClaim`, or uses a Pod-level `ResourceClaimTemplate`. The Claim contains only `Exactly + ExactCount` requests. Inside a single queue, allocated Tasks are checked against a hard limit using the `DeviceClass` declared in the request and the raw capacity quantity. Claims with the same name are partially deduplicated.
 
-即使在这个窄范围内，仍存在共享 Claim admission 重复计费、inqueue 跨 session 丢失、层级祖先队列重建漏计、`capability: 0` 被当成无限制等 correctness bug。因此不建议把当前实现描述为可提供严格 DRA queue quota 或与普通 capacity 资源完全等价。
+Even inside that narrow range there are correctness bugs: shared Claim admission is charged more than once, inqueue state is lost across sessions, hierarchical ancestor queues miss usage when they are rebuilt, and `capability: 0` is treated as unlimited. The current implementation should not be described as strict DRA queue quota, or as fully equivalent to ordinary capacity resources.
 
-## 3. 设计承诺与当前实现对照
+## Design Promises Compared with the Current Implementation
 
-| 能力 | 文档声明 | 当前实现 | 结论 |
+| Capability | Documented promise | Current implementation | Conclusion |
 |---|---|---|---|
-| `capability` device count | hard upper bound | `checkDRAAllocatable` 单独检查 | 部分可用，但有绕过和边界 bug |
-| `capability` capacity dimension | hard upper bound | 检查 Claim 中的原始请求量 | 契约不清；不是实际 `ConsumedCapacity` |
-| `deserved` | soft share / borrow / reclaim | 只解析，DRA allocated 未参与 share/reclaim | 未实现 |
-| `guarantee` | minimum protected share | 只解析，DRA usage 未参与保护或回收 | 未实现 |
-| direct Claim | 支持 | 正常路径支持 | informer race 会丢 Task |
-| Pod 级 ClaimTemplate | 支持 | resolved Claim 支持 | 正常路径基本成立 |
-| shared Claim | 每个 Claim 一次 | allocation 局部去重 | enqueue、跨 queue/祖先重建不一致 |
-| `FirstAvailable` | deferred | 静默跳过 | 会绕过 hard quota |
-| `allocationMode: All` | deferred | 静默跳过 | 会绕过 hard quota |
-| DRA Extended Resource | 未说明 | 完全不进入摘要 | v1.36 beta 能力未覆盖 |
-| Kubernetes Workload/PodGroup Claim | 未说明 | 未接入 native PodGroup cycle state | v1.36 alpha 能力未覆盖 |
-| root DRA total | cluster state 或显式配置 | 只有显式 Queue 配置 | 文档与实现不符 |
+| `capability` device count | hard upper bound | checked separately by `checkDRAAllocatable` | Partly usable, with bypasses and boundary bugs |
+| `capability` capacity dimension | hard upper bound | checks the raw quantity in the Claim | Contract is unclear. This is not actual `ConsumedCapacity` |
+| `deserved` | soft share / borrow / reclaim | parsed only. DRA allocated does not participate in share or reclaim | Not implemented |
+| `guarantee` | minimum protected share | parsed only. DRA usage does not participate in protection or reclaim | Not implemented |
+| direct Claim | supported | supported on the normal path | An informer race can drop the Task |
+| Pod-level ClaimTemplate | supported | supported for a resolved Claim | The normal path mostly holds |
+| shared Claim | once per Claim | partial dedup during allocation | enqueue and cross-queue/ancestor rebuild are inconsistent |
+| `FirstAvailable` | deferred | skipped silently | Bypasses the hard quota |
+| `allocationMode: All` | deferred | skipped silently | Bypasses the hard quota |
+| DRA Extended Resource | not stated | never enters the summary | v1.36 beta capability is uncovered |
+| Kubernetes Workload/PodGroup Claim | not stated | native PodGroup cycle state is not wired | v1.36 alpha capability is uncovered |
+| root DRA total | cluster state or explicit configuration | only explicit Queue configuration | Document and implementation disagree |
 
-## 4. 按严重级别排序的问题
+## Findings by Severity
 
-### 4.1 Critical：unsupported 请求被静默跳过，可绕过 hard quota
+### 4.1 Critical: unsupported requests are skipped silently and can bypass the hard quota
 
-类型：**correctness bug + 不安全的限制处理**
+Type: **correctness bug and unsafe handling of a limitation**
 
-证据：
+Evidence:
 
-- 设计把 `capability` 定义为 hard upper bound：`docs/design/capacity-dra-support.md:42-52`。
-- `FirstAvailable` 和 `allocationMode: All` 只是被描述为“不是主要目标”：`docs/design/capacity-dra-support.md:164-172`。
-- cache 对两类请求只打印 warning 后 `continue`：
+- The design defines `capability` as a hard upper bound: `docs/design/capacity-dra-support.md:42-52`.
+- `FirstAvailable` and `allocationMode: All` are only described as "not the main target": `docs/design/capacity-dra-support.md:164-172`.
+- The cache prints a warning and then `continue`s for both request kinds:
   - `pkg/scheduler/cache/cache.go:1973-1977`
   - `pkg/scheduler/cache/cache.go:1982-1985`
-- 如果一个 Claim 全部是上述请求，`buildTaskDRAInfo` 最终返回 nil：`pkg/scheduler/cache/cache.go:2007-2024`。
-- capacity 在 `taskDRA == nil` 时直接放行：`pkg/scheduler/plugins/capacity/capacity.go:246-249`。
+- If every request in a Claim is one of those kinds, `buildTaskDRAInfo` returns nil: `pkg/scheduler/cache/cache.go:2007-2024`.
+- capacity allows the Task when `taskDRA == nil`: `pkg/scheduler/plugins/capacity/capacity.go:246-249`.
 
-影响：
+Impact:
 
-- 一个 queue 配置了 `deviceclass/gpu.example.com: "1"`，用户可以改用 `FirstAvailable` 或 `All` 请求同一类设备，Volcano 会把请求视为没有 DRA quota consumption。
-- 混合 Claim 中只有支持的 request 被计费，其余 request 仍然绕过 quota。
-- 这是 silent fail-open，不符合 hard upper bound 的安全边界。
+- A queue configured with `deviceclass/gpu.example.com: "1"` can be bypassed by requesting the same class of device with `FirstAvailable` or `All`. Volcano treats the request as having no DRA quota consumption.
+- In a mixed Claim, only the supported request is charged. The remaining requests still bypass quota.
+- This is a silent fail-open. It does not match the safety boundary of a hard upper bound.
 
-建议：
+Recommendation:
 
-- 第一版若不支持这些模式，应在 queue 启用了相关 DRA quota 时明确拒绝，并给 PodGroup/Job 记录可诊断事件；
-- cache 不能把“不支持”压缩成“无 DRA 请求”，至少要保留 unsupported reason 和涉及的 DeviceClass；
-- 长期支持 `FirstAvailable` 时，计费必须跟随 Kubernetes Filter 选中的 subrequest；不能把所有备选项相加，也不能固定取第一个；
-- `All` 的数量依赖匹配设备集合，不能仅从 Claim Spec 得出，应基于实际 allocation result 或明确不支持。
-
-### 4.2 Critical：`deserved` / `guarantee` 并未实现，且可能扭曲 queue 排序
-
-类型：**实现缺口 + correctness bug**
+- If the first version does not support these modes, reject them explicitly when the queue has the related DRA quota enabled, and record a diagnosable event on the PodGroup or Job.
+- The cache must not compress "unsupported" into "no DRA request." It must at least keep the unsupported reason and the DeviceClass involved.
+- When `FirstAvailable` is supported later, charging must follow the subrequest selected by Kubernetes Filter. Do not add every alternative, and do not always take the first one.
+- The quantity for `All` depends on the matched device set. It cannot be derived from the Claim Spec alone. Use the actual allocation result, or state clearly that it is unsupported.
 
-证据：
+### 4.2 Critical: `deserved` / `guarantee` are not implemented and can distort queue ordering
 
-- 文档声明三者语义与普通资源完全相同：`docs/design/capacity-dra-support.md:42-52`、`174-181`。
-- DRA-specific `deserved` 和 `guarantee` 被解析进 `draQuotaAttr`：`pkg/scheduler/plugins/capacity/capacity.go:103-115`、`181-190`。
-- 除初始化和 clone 外，没有任何逻辑读取 `dra.deserved` 或 `dra.guarantee`；DRA 检查只使用 `dra.capability`：`pkg/scheduler/plugins/capacity/capacity.go:246-305`。
-- queue share 仍只读取普通 `attr.allocated` 和普通 `attr.deserved`：
-  `pkg/scheduler/plugins/capacity/capacity.go:1817-1843`。
-- DRA Task 只更新 `attr.dra.allocated`，不会把 DRA key 写入普通
-  `attr.allocated.ScalarResources`：`pkg/scheduler/plugins/capacity/capacity.go:351-409`、
-  `924-1003`。
-
-影响：
+Type: **implementation gap and correctness bug**
 
-- 只配置 DRA `deserved` 的 queue 会在普通 `attr.deserved` 中包含 DRA key，但对应普通 allocated 永远为 0，因此 share 可能长期保持 0，获得不符合实际 DRA 使用量的高优先级。
-- DRA 使用量不会参与 queue borrow、reclaim、preemption 或 guarantee 保护。
-- 示例中 `deserved` / `guarantee` 的值对 DRA 实际调度没有文档宣称的作用。
+Evidence:
 
-建议：
+- The document says the three fields have exactly the same semantics as ordinary resources: `docs/design/capacity-dra-support.md:42-52` and `174-181`.
+- DRA-specific `deserved` and `guarantee` are parsed into `draQuotaAttr`: `pkg/scheduler/plugins/capacity/capacity.go:103-115` and `181-190`.
+- Nothing reads `dra.deserved` or `dra.guarantee` except initialization and clone. The DRA check uses only `dra.capability`: `pkg/scheduler/plugins/capacity/capacity.go:246-305`.
+- Queue share still reads only ordinary `attr.allocated` and ordinary `attr.deserved`: `pkg/scheduler/plugins/capacity/capacity.go:1817-1843`.
+- A DRA Task updates only `attr.dra.allocated`. It does not write the DRA key into ordinary `attr.allocated.ScalarResources`: `pkg/scheduler/plugins/capacity/capacity.go:351-409` and `924-1003`.
 
-- 最小可交付版本只承诺并允许 DRA `capability`；暂时从设计和用户指南移除 DRA `deserved` / `guarantee` 示例，必要时拒绝这些 key；
-- 只有在 DRA count/capacity 被接入 queue dominant share、reclaim victim 判断、guarantee 和 hierarchy 计算后，才能宣称与普通资源相同；
-- 不要仅把 DRA key 塞入普通 `Resource` 来“复用”语义，除非 allocation、request、inqueue、elastic 的同名 scalar 也完整维护。
+Impact:
 
-### 4.3 High：shared Claim 在 Job enqueue 阶段仍按 Pod 重复计费
+- A queue that configures only DRA `deserved` carries the DRA key in ordinary `attr.deserved`, while the corresponding ordinary allocated stays 0 forever. Share can remain 0 and the queue can receive a high priority that does not match its real DRA usage.
+- DRA usage does not participate in queue borrow, reclaim, preemption, or guarantee protection.
+- The `deserved` and `guarantee` values in the examples do not have the effect on real DRA scheduling that the document claims.
 
-类型：**correctness bug**
+Recommendation:
 
-证据：
+- The minimum deliverable version should promise and allow only DRA `capability`. Remove DRA `deserved` / `guarantee` examples from the design and user guide for now, and reject those keys if necessary.
+- Claim equivalence with ordinary resources only after DRA count and capacity are wired into queue dominant share, reclaim victim selection, guarantee, and hierarchy calculation.
+- Do not stuff DRA keys into an ordinary `Resource` only to "reuse" the semantics, unless the scalar of the same name is fully maintained for allocation, request, inqueue, and elastic.
 
-- 文档承诺同一个 shared Claim 只计一次：
-  `docs/design/capacity-dra-support.md:134-141`。
-- allocation 阶段确实使用 per-queue refcount 去重：
-  `pkg/scheduler/plugins/capacity/capacity.go:321-409`。
-- 但 `JobInfo.GetMinDRAResources` 只聚合每个 Task 的 `DRAResreq`，完全没有使用
-  `ResourceClaimKeys` 或 `ResourceClaimDRAResreq`：
-  `pkg/scheduler/api/job_info.go:1492-1584`。
-- 没有 `TaskMinAvailable` 时，它按 Task 逐个相加：`pkg/scheduler/api/job_info.go:1525-1552`；
-  有 task role 时，它把一个 Task 的请求乘以该 role 的最小副本数：
-  `pkg/scheduler/api/job_info.go:1560-1579`。
-- shared Claim E2E 有两个副本，但故意使用 `minAvailable=1`：
-  `test/e2e/dra/dra_quota_test.go:147-169`，因此没有覆盖 `minAvailable=2`
-  时的重复计费。
+### 4.3 High: a shared Claim is still charged once per Pod at Job enqueue
 
-影响：
+Type: **correctness bug**
 
-- 两个 gang member 引用同一个 count=1 Claim，queue capability=1、minAvailable=2 时，Job enqueue 会计算成 2 并拒绝；而 allocation 和 Queue Status 又只显示 1。
-- 同一份配额在 admission 和 allocation 阶段具有不同语义。
+Evidence:
 
-建议：
+- The document promises that the same shared Claim is counted once: `docs/design/capacity-dra-support.md:134-141`.
+- The allocation path does deduplicate with a per-queue refcount: `pkg/scheduler/plugins/capacity/capacity.go:321-409`.
+- `JobInfo.GetMinDRAResources` aggregates each Task's `DRAResreq` and does not use `ResourceClaimKeys` or `ResourceClaimDRAResreq`: `pkg/scheduler/api/job_info.go:1492-1584`.
+- Without `TaskMinAvailable`, it adds Tasks one by one: `pkg/scheduler/api/job_info.go:1525-1552`. With a task role, it multiplies one Task's request by that role's minimum replica count: `pkg/scheduler/api/job_info.go:1560-1579`.
+- The shared Claim e2e has two replicas but deliberately uses `minAvailable=1`: `test/e2e/dra/dra_quota_test.go:147-169`. It does not cover the double charge at `minAvailable=2`.
 
-- `GetMinDRAResources` 必须按 Claim identity 聚合，不应先聚合到 Task 后再乘副本数；
-- Claim identity 应优先使用 UID，而不是 `namespace/name`，以区分删除后同名重建；
-- 对共享 Claim，应明确计费范围：
-  - leaf queue：每个 Claim 每个 leaf queue 一次；
-  - ancestor/root：同一祖先子树内每个 Claim 一次；
-  - 跨 leaf queue 共享时是否每个 leaf 都收费，必须写入契约。
+Impact:
 
-### 4.4 High：DRA inqueue reservation 没有跨 scheduling session 重建
+- Two gang members reference the same count=1 Claim, with queue capability=1 and minAvailable=2. Job enqueue computes 2 and rejects the Job, while allocation and Queue Status show 1.
+- The same quota has different semantics at admission and allocation.
 
-类型：**correctness bug**
+Recommendation:
 
-证据：
+- `GetMinDRAResources` must aggregate by Claim identity. It must not aggregate per Task and then multiply by replica count.
+- Claim identity should prefer UID over `namespace/name`, so a same-name recreation after deletion is distinct.
+- For a shared Claim, define the charging domain explicitly:
+  - leaf queue: once per Claim per leaf queue;
+  - ancestor/root: once per Claim inside the same ancestor subtree;
+  - when a Claim is shared across leaf queues, whether every leaf is charged must be written into the contract.
 
-- Job 刚被 admission 时，`AddJobEnqueuedFn` 会把 `GetMinDRAResources` 加入
-  `dra.inqueue`：`pkg/scheduler/plugins/capacity/capacity.go:781-813`。
-- 新 session 初始化 queue 时，`dra.inqueue` 总是空 map：
-  `pkg/scheduler/plugins/capacity/capacity.go:181-188`。
-- session open 会从已有 Job 重建普通 `attr.inqueue`，但没有任何对应的
-  `updateDRAInqueue`：
-  - 非层级队列：`pkg/scheduler/plugins/capacity/capacity.go:1124-1144`
-  - 层级队列：`pkg/scheduler/plugins/capacity/capacity.go:1271-1288`
-- Task 分配时会增加 `dra.allocated`，但不会从 `dra.inqueue` 扣除已覆盖的最小需求：
-  `pkg/scheduler/plugins/capacity/capacity.go:924-963`。
-- Task allocatable 检查显式忽略 inqueue，而 Job enqueue 检查会同时计算 allocated 和
-  inqueue：`pkg/scheduler/plugins/capacity/capacity.go:1646-1655`、
-  `1697-1719`。
-- enqueue 检查依赖 `allocated + inqueue + request`：
-  `pkg/scheduler/plugins/capacity/capacity.go:1711-1719`。
+### 4.4 High: DRA inqueue reservation is not rebuilt across scheduling sessions
 
-影响：
+Type: **correctness bug**
 
-- 一个已经 Inqueue、但因物理设备暂不可用而尚未分配的 DRA Job，只在 admission 所在 session 预留 quota；
-- 下一个 session 会忘记这份 reservation，后续 Job 可以继续 Inqueue，行为与普通 capacity resource 不一致；
-- 同一个 session 内，Job 被 admission 后又分配了部分 Task 时，`dra.allocated` 与完整
-  `dra.inqueue` 会同时保留；正常 action 顺序下 Task hard check 不读 inqueue，但如果同一 session
-  再执行 enqueue 检查，就会把已覆盖部分重复计算；
-- 单个 Task allocation 的 hard check仍可能阻止实际超额，但 queue admission、gang reservation 和公平性已经失真。
+Evidence:
 
-建议：
+- When a Job is first admitted, `AddJobEnqueuedFn` adds `GetMinDRAResources` to `dra.inqueue`: `pkg/scheduler/plugins/capacity/capacity.go:781-813`.
+- A new session initializes `dra.inqueue` as an empty map: `pkg/scheduler/plugins/capacity/capacity.go:181-188`.
+- Session open rebuilds ordinary `attr.inqueue` from existing Jobs, but there is no corresponding `updateDRAInqueue`:
+  - non-hierarchical queues: `pkg/scheduler/plugins/capacity/capacity.go:1124-1144`
+  - hierarchical queues: `pkg/scheduler/plugins/capacity/capacity.go:1271-1288`
+- Allocating a Task increases `dra.allocated` and does not subtract the covered minimum demand from `dra.inqueue`: `pkg/scheduler/plugins/capacity/capacity.go:924-963`.
+- The Task allocatable check explicitly ignores inqueue, while the Job enqueue check counts both allocated and inqueue: `pkg/scheduler/plugins/capacity/capacity.go:1646-1655` and `1697-1719`.
+- The enqueue check depends on `allocated + inqueue + request`: `pkg/scheduler/plugins/capacity/capacity.go:1711-1719`.
 
-- session open 必须像普通资源一样重建 DRA inqueue；
-- 重建值应为“Job 最小 DRA 需求中尚未由已 allocated Claim 覆盖的部分”，并按 Claim 去重，避免同时出现在 allocated 和 inqueue；
-- 在 session 内 Job 从 inqueue 转成部分 allocated 时，也应维护同一个“未覆盖 remainder”，不能一边保留完整
-  minDRA、一边增加 allocated；
-- 增加跨两个 session 的单元测试，不能只直接调用 `updateDRAInqueue` 构造状态。
+Impact:
 
-### 4.5 High：层级 queue 重建会漏计或重复计算祖先 DRA usage
+- A DRA Job that is already Inqueue, but not yet allocated because no physical device is available, reserves quota only in the session where it was admitted.
+- The next session forgets that reservation. A later Job can continue to enter Inqueue, which is inconsistent with ordinary capacity resources.
+- Inside one session, after a Job is admitted and some of its Tasks are allocated, `dra.allocated` and the full `dra.inqueue` are both retained. In the normal action order the Task hard check does not read inqueue. If enqueue is checked again in the same session, the covered part is counted twice.
+- The hard check on a single Task allocation may still prevent a real overrun, but queue admission, gang reservation, and fairness are already distorted.
 
-类型：**correctness bug**
+Recommendation:
 
-证据：
+- Session open must rebuild DRA inqueue the same way it rebuilds ordinary resources.
+- The rebuilt value should be the part of the Job's minimum DRA demand that is not yet covered by an allocated Claim, deduplicated by Claim, so the same usage is not present in both allocated and inqueue.
+- When a Job moves from inqueue to partially allocated inside a session, maintain that same uncovered remainder. Do not keep the full minDRA while also increasing allocated.
+- Add a unit test that crosses two sessions. Calling `updateDRAInqueue` directly to construct state is not enough.
 
-- session open 只在 leaf `attr.dra != nil` 时统计已分配 Task：
-  `pkg/scheduler/plugins/capacity/capacity.go:1255-1263`。
-- 然后只把 leaf 的数值 delta 传播给配置了同一 DeviceClass capability 的祖先：
-  `pkg/scheduler/plugins/capacity/capacity.go:1296-1318`。
-- 传播的是聚合数值，没有把 Claim refcount 一起传播。
-- 与之相对，session 运行期间的 Allocate/Deallocate event 会直接对每个祖先调用
-  `addTaskDRAAllocated` / `removeTaskDRAAllocated`，保留 refcount：
-  `pkg/scheduler/plugins/capacity/capacity.go:924-1003`。
+### 4.5 High: hierarchical queue rebuild can miss or double-count ancestor DRA usage
 
-影响：
+Type: **correctness bug**
 
-- 父 queue 配置 DRA capability、子 leaf 没配置时，重建 leaf usage 得到 nil，父 queue 看不到 session 开始前已经存在的 DRA allocation；
-- 同一个 Claim 被不同 leaf queue 引用时，数值 delta 会在父 queue 重复相加，而 Queue Status 的 root 重算又会按 Claim key 去重；
-- session 内增量状态、下一 session 重建状态和 `status.allocated` 三者可能给出不同答案。
+Evidence:
 
-建议：
+- Session open counts allocated Tasks only when the leaf `attr.dra != nil`: `pkg/scheduler/plugins/capacity/capacity.go:1255-1263`.
+- It then propagates only the leaf's numeric delta to ancestors that configure capability for the same DeviceClass: `pkg/scheduler/plugins/capacity/capacity.go:1296-1318`.
+- The propagated value is an aggregated number. The Claim refcount is not propagated with it.
+- During the session, Allocate and Deallocate events call `addTaskDRAAllocated` / `removeTaskDRAAllocated` directly on every ancestor and keep the refcount: `pkg/scheduler/plugins/capacity/capacity.go:924-1003`.
 
-- 不要从 leaf 的聚合 delta 推导祖先 Claim usage；
-- session open 应遍历 allocated Task，并在 leaf 及其每个祖先上使用同一套按 Claim identity 的 refcount 逻辑；
-- 增加“只有 parent 配 quota”“跨两个 leaf 共享一个 Claim”“session 重开”测试。
+Impact:
 
-### 4.6 High：count-only capability 会意外拒绝带 capacity request 的 Claim
+- If the parent queue configures DRA capability and the child leaf does not, rebuilding leaf usage yields nil. The parent cannot see DRA allocations that already existed before the session started.
+- When different leaf queues reference the same Claim, the numeric delta is added again on the parent, while the root recalculation of Queue Status deduplicates by Claim key.
+- Incremental state inside the session, rebuilt state in the next session, and `status.allocated` can give different answers.
 
-类型：**correctness bug / 契约缺失**
+Recommendation:
 
-证据：
+- Do not derive ancestor Claim usage from a leaf's aggregated delta.
+- Session open should walk allocated Tasks and use the same Claim-identity refcount logic on the leaf and on each ancestor.
+- Add tests for "only the parent has quota," "two leaves share one Claim," and "the session is reopened."
 
-- `checkDRAAllocatable` 只要启用了 consumable capacity，就遍历请求中的每个 dimension；
-- 如果 queue 没配置该 dimension，会直接返回 false：
-  `pkg/scheduler/plugins/capacity/capacity.go:282-300`。
+### 4.6 High: a count-only capability unexpectedly rejects a Claim that requests capacity
 
-影响：
+Type: **correctness bug / missing contract**
 
-- queue 只想限制设备数量，配置
-  `deviceclass/gpu.example.com: "4"`；
-- Claim 请求同一 DeviceClass，并附带 `memory: 8Gi`；
-- 即使 queue 没有声明 memory quota，也会因为 capability 中没有 memory dimension 而被拒绝。
+Evidence:
 
-这与“没有配置某个 quota key 就不限制该维度”的通常 ResourceList 语义不一致，也与代码对未配置 DeviceClass 直接放行的行为不一致。
+- Once consumable capacity is enabled, `checkDRAAllocatable` walks every dimension in the request.
+- If the queue does not configure that dimension, it returns false: `pkg/scheduler/plugins/capacity/capacity.go:282-300`.
 
-建议：
+Impact:
 
-- 未配置的 capacity dimension 应视为不限制；
-- 如果期望 allowlist 语义，必须在设计中明确说明，并提供独立开关，不能从“出现了 count key”隐式推导。
+- The queue only wants to limit device count and configures `deviceclass/gpu.example.com: "4"`.
+- The Claim requests the same DeviceClass and also requests `memory: 8Gi`.
+- Even though the queue declared no memory quota, the Claim is rejected because capability has no memory dimension.
 
-### 4.7 High：`deviceclass/<class>: "0"` 实际表示“不限制”
+This disagrees with the usual ResourceList semantic that an unconfigured quota key does not limit that dimension. It also disagrees with the code path that allows an unconfigured DeviceClass.
 
-类型：**correctness bug**
+Recommendation:
 
-证据：
+- An unconfigured capacity dimension should mean unlimited.
+- If allowlist semantics are intended, the design must say so and provide a separate switch. Do not infer them from the presence of a count key.
 
-- count hard limit 只有 `capability.Count > 0` 时才检查：
-  `pkg/scheduler/plugins/capacity/capacity.go:273-280`。
-- Queue DRA key 没有整数、非负和零值语义校验：
-  `pkg/scheduler/plugins/capacity/capacity.go:142-179`。
+### 4.7 High: `deviceclass/<class>: "0"` actually means unlimited
 
-影响：
+Type: **correctness bug**
 
-- 管理员把 count capability 设为 0，直觉上表示禁止该 queue 使用设备；
-- 实际检查被跳过，变成无限制；
-- 负数也会关闭检查；小数经过 `Quantity.Value()` 舍入后的结果不够直观。
+Evidence:
 
-建议：
+- The count hard limit is checked only when `capability.Count > 0`: `pkg/scheduler/plugins/capacity/capacity.go:273-280`.
+- Queue DRA keys are not validated as integer, non-negative, or zero: `pkg/scheduler/plugins/capacity/capacity.go:142-179`.
 
-- 0 必须是有效 hard zero；
-- 拒绝负数和非整数 count；
-- “未配置”与“配置为 0”必须使用 map key 是否存在区分，不能用数值正负区分。
+Impact:
 
-### 4.8 High：direct ResourceClaim informer race 可能导致 Pod 从 cache 丢失
+- An administrator sets count capability to 0, which intuitively forbids the queue from using the device.
+- The check is skipped, so the queue is unlimited.
+- A negative value also disables the check. A fractional value rounded by `Quantity.Value()` is not intuitive.
 
-类型：**correctness bug**
+Recommendation:
 
-证据：
+- 0 must be a valid hard zero.
+- Reject negative and non-integer counts.
+- "Not configured" and "configured as 0" must be distinguished by whether the map key exists, not by the sign of the value.
 
-- Pod 到达时，如果 direct Claim 尚未进入 ResourceClaim informer cache，
-  `buildTaskDRAInfo` 返回普通 error：`pkg/scheduler/cache/cache.go:1950-1965`。
-- `addPod` 只对 `pendingDRAResourceClaimError` 先 `addTask` 再 resync；
-  当前只有 template 路径会构造该错误：
-  `pkg/scheduler/cache/event_handlers.go:270-280`。
-- 普通 error 路径只调用 `resyncTask(pi)`，没有把 Task 加入 `sc.Jobs`：
-  `pkg/scheduler/cache/event_handlers.go:298-300`。
-- `processResyncTask` 随后必须先从 `sc.Jobs` 找到 Task，找不到就 Forget：
-  `pkg/scheduler/cache/cache.go:1224-1263`。
+### 4.8 High: a direct ResourceClaim informer race can drop a Pod from the cache
 
-影响：
+Type: **correctness bug**
 
-- Pod ADD 先于 direct ResourceClaim informer ADD 时，这个 Pod 可能不会进入 scheduler cache；
-- ResourceClaim 后续到达也没有这里对应的 Task 可重试；
-- 现有测试只验证 build 函数返回 error，没有覆盖 `addPod` 的恢复：
-  `pkg/scheduler/cache/cache_dra_test.go:227-237`。
+Evidence:
 
-建议：
+- When the Pod arrives and the direct Claim is not yet in the ResourceClaim informer cache, `buildTaskDRAInfo` returns an ordinary error: `pkg/scheduler/cache/cache.go:1950-1965`.
+- `addPod` calls `addTask` and then resyncs only for `pendingDRAResourceClaimError`. Today only the template path constructs that error: `pkg/scheduler/cache/event_handlers.go:270-280`.
+- The ordinary error path only calls `resyncTask(pi)` and does not add the Task to `sc.Jobs`: `pkg/scheduler/cache/event_handlers.go:298-300`.
+- `processResyncTask` must then find the Task in `sc.Jobs`. If it cannot, it Forgets the work: `pkg/scheduler/cache/cache.go:1224-1263`.
 
-- direct Claim 的 NotFound/informer-not-synced 应与 template race 使用相同的 pending 路径；
-- 其他读取错误仍应保留 fail-fast，避免吞掉真实故障；
-- 增加与 `TestAddPodWithUnresolvedResourceClaimTemplateCachesTaskForResync`
-  对称的 direct Claim 测试。
+Impact:
 
-### 4.9 High：capacity dimension key 无法表达常见的 fully-qualified DRA capacity name
+- If a Pod ADD arrives before the direct ResourceClaim informer ADD, the Pod may never enter the scheduler cache.
+- When the ResourceClaim arrives later, there is no Task here to retry.
+- Existing tests only check that the build function returns an error. They do not cover recovery in `addPod`: `pkg/scheduler/cache/cache_dra_test.go:227-237`.
 
-类型：**设计/API 问题**
+Recommendation:
 
-证据：
+- NotFound and informer-not-synced for a direct Claim should use the same pending path as the template race.
+- Other read errors should still fail fast, so a real fault is not swallowed.
+- Add a direct Claim test symmetric to `TestAddPodWithUnresolvedResourceClaimTemplateCachesTaskForResync`.
 
-- 设计编码为 `<dim>.deviceclass/<DeviceClass>`：
-  `docs/design/capacity-dra-support.md:33-40`。
-- Kubernetes DRA 的 `QualifiedName` 允许并鼓励第三方 capacity 使用
-  `<domain>/<name>`，例如 `dra.example.com/memory`。
-- 把该 dimension 代入当前格式会得到
-  `dra.example.com/memory.deviceclass/gpu.example.com`，其中包含两个 `/`，
-  不能作为 Kubernetes `ResourceName`。
-- parser 本身允许 separator 前包含 `/`，但对象会先受到 API ResourceName 格式约束：
-  `pkg/scheduler/plugins/capacity/capacity.go:142-163`。
+### 4.9 High: the capacity dimension key cannot express a common fully-qualified DRA capacity name
 
-影响：
+Type: **design/API problem**
 
-- 当前 key 只可靠支持无 domain 的简单 dimension；
-- 设计声称通用支持 consumable capacity，但无法配置第三方 fully-qualified capacity；
-- dimension 与 DeviceClass 的拼接还受 ResourceName 长度限制。
+Evidence:
 
-建议：
+- The design encodes the key as `<dim>.deviceclass/<DeviceClass>`: `docs/design/capacity-dra-support.md:33-40`.
+- Kubernetes DRA `QualifiedName` allows and encourages a third-party capacity to use `<domain>/<name>`, for example `dra.example.com/memory`.
+- Substituting that dimension into the current format produces `dra.example.com/memory.deviceclass/gpu.example.com`, which contains two `/` characters and cannot be a Kubernetes `ResourceName`.
+- The parser itself allows `/` before the separator, but the object is first constrained by the API ResourceName format: `pkg/scheduler/plugins/capacity/capacity.go:142-163`.
 
-- 第一版明确限制为 unqualified dimension，并把限制写入 API 文档；或
-- 重新设计可逆且合法的 key encoding；
-- 如果可读性和完整表达都要求保留，应该重新评估“绝不新增 DRA-specific queue field”这个 non-goal，避免用脆弱字符串编码硬塞进 `ResourceList`。
+Impact:
 
-### 4.10 High：声明的 capacity request 不等于 Kubernetes 实际 consumed capacity
+- The current key reliably supports only a simple dimension with no domain.
+- The design claims general consumable-capacity support, but a third-party fully-qualified capacity cannot be configured.
+- Concatenating the dimension and DeviceClass is also limited by ResourceName length.
 
-类型：**设计契约问题；若声称物理消耗配额则是 correctness bug**
+Recommendation:
 
-证据：
+- For the first version, restrict the key to an unqualified dimension and write that limit into the API documentation; or
+- redesign a reversible and legal key encoding; or
+- if both readability and complete expression must be kept, re-evaluate the non-goal of "never add a DRA-specific queue field," so the value is not forced into `ResourceList` with a fragile string encoding.
 
-- 当前 cache 把 Claim Spec 中每个设备的原始请求量乘以 count：
-  `pkg/scheduler/cache/cache.go:1905-1921`、`1991-2005`。
-- 文档也用“2 × 8Gi = 16Gi”定义逻辑用量：
-  `docs/design/capacity-dra-support.md:143-154`。
-- Kubernetes v1.36 中：
-  - `requestPolicy` 可以把请求量向上调整；
-  - 未显式请求某 dimension 时，实际默认消耗可能是整个 device capacity；
-  - 最终值记录在 allocation result 的
-    `results[*].consumedCapacity`。
+### 4.10 High: the declared capacity request is not the capacity Kubernetes actually consumes
 
-影响：
+Type: **design contract problem. If the feature claims a physical consumption quota, this is a correctness bug.**
 
-- queue status 和 hard check 可能低于设备实际消耗；
-- 同一 Claim 在不同可选设备上可能产生不同的实际 consumed capacity；
-- partitionable / multi-allocation device 尤其容易出现差异。
+Evidence:
 
-建议：
+- The cache multiplies the raw per-device quantity in the Claim Spec by count: `pkg/scheduler/cache/cache.go:1905-1921` and `1991-2005`.
+- The document also defines logical usage as "2 × 8Gi = 16Gi": `docs/design/capacity-dra-support.md:143-154`.
+- In Kubernetes v1.36:
+  - `requestPolicy` can round the requested quantity up;
+  - when a dimension is not requested explicitly, the actual default consumption may be the whole device capacity;
+  - the final value is recorded in `results[*].consumedCapacity` of the allocation result.
 
-- 二选一明确契约：
-  1. **requested-capacity quota**：只限制用户在 Claim Spec 中声明的原始数量。实现较简单，但必须改名并明确它不是物理 usage；
-  2. **consumed-capacity quota**：必须使用 Kubernetes 选中节点后的 allocation result，并处理 Reserve/rollback/session restore。不能只读 Claim Spec。
-- 第一版建议选择 1，并把 requestPolicy、默认 consumption 和 partitionable device 明确列为不保证物理上限的场景。
+Impact:
 
-### 4.11 Medium：Kubernetes v1.36 DRA Extended Resource 完全不计入 DRA quota
+- Queue status and the hard check can be lower than the device's actual consumption.
+- The same Claim can produce different actual consumed capacity on different candidate devices.
+- Partitionable and multi-allocation devices are especially likely to diverge.
 
-类型：**实现缺口 / 未声明边界**
+Recommendation:
 
-证据：
+- Choose one contract and state it:
+  1. **requested-capacity quota**: limit only the raw quantity the user declared in the Claim Spec. This is simpler to implement, but it must be renamed and it must be explicit that this is not physical usage.
+  2. **consumed-capacity quota**: use the allocation result after Kubernetes selects a node, and handle Reserve, rollback, and session restore. Reading the Claim Spec is not enough.
+- The first version should choose 1, and should list requestPolicy, default consumption, and partitionable devices as cases that do not guarantee a physical upper bound.
 
-- `buildTaskDRAInfo` 在 `pod.Spec.ResourceClaims` 为空时直接返回：
-  `pkg/scheduler/cache/cache.go:1924-1927`。
-- Kubernetes v1.36 的 `DRAExtendedResource` 已为 beta；native
-  `DynamicResources` 会在 PreFilter/Filter 中为 Pod 的 extended resource
-  构造或复用特殊 ResourceClaim。
+### 4.11 Medium: Kubernetes v1.36 DRA Extended Resource is not counted in DRA quota
 
-影响：
+Type: **implementation gap / undeclared boundary**
 
-- 使用 extended resource 兼容入口的 DRA workload 不会消耗
-  `deviceclass/*` quota；
-- 它可能仍消耗普通 extended resource queue quota，但这和 DeviceClass quota
-  是两个不同配置键，不能替代设计承诺。
+Evidence:
 
-建议：
+- `buildTaskDRAInfo` returns immediately when `pod.Spec.ResourceClaims` is empty: `pkg/scheduler/cache/cache.go:1924-1927`.
+- Kubernetes v1.36 `DRAExtendedResource` is beta. Native `DynamicResources` constructs or reuses a special ResourceClaim for the Pod's extended resource during PreFilter and Filter.
 
-- 在支持矩阵中明确 DRA Extended Resource 不受 DeviceClass quota 管理；
-- 长期应复用 native DynamicResources 生成的实际 Claim/Request mapping，避免 cache 自己再推导一次。
+Impact:
 
-### 4.12 Medium：root queue “自动集群总量”没有实现，也很难按 DeviceClass 唯一计算
+- A DRA workload that enters through the extended-resource compatibility path does not consume `deviceclass/*` quota.
+- It may still consume ordinary extended-resource queue quota, but that is a different configuration key and cannot replace the design promise.
 
-类型：**文档与实现不一致**
+Recommendation:
 
-证据：
+- State in the support matrix that a DRA Extended Resource is not managed by DeviceClass quota.
+- Longer term, reuse the actual Claim and request mapping produced by native DynamicResources, so the cache does not derive it a second time.
 
-- 文档称 DRA cluster-wide total 可以来自实际 cluster state：
-  `docs/design/capacity-dra-support.md:156-162`。
-- capacity plugin 没有读取 `ResourceSlice` 或 `DeviceClass`；
-- DRA total 只来自 Queue 的 `capability` / `deserved` / `guarantee`
-  parser：`pkg/scheduler/plugins/capacity/capacity.go:142-192`。
+### 4.12 Medium: the root queue "automatic cluster total" is not implemented, and a unique DeviceClass total is hard to compute
 
-设计上还存在一个更基本的问题：多个 DeviceClass selector 可以匹配同一物理设备，因此“按 DeviceClass 自动汇总 total”不一定可加，也不一定唯一。
+Type: **document and implementation disagree**
 
-建议：
+Evidence:
 
-- 当前版本明确为 **仅管理员显式配置 root DRA capability**；
-- 不承诺从 ResourceSlice 自动计算 DeviceClass total；
-- 如果未来需要自动 total，必须先定义 DeviceClass 重叠、node-local/global device、
-  partitionable device 和 incomplete ResourceSlice generation 的处理规则。
+- The document says the cluster-wide DRA total can come from actual cluster state: `docs/design/capacity-dra-support.md:156-162`.
+- The capacity plugin does not read `ResourceSlice` or `DeviceClass`.
+- The DRA total comes only from the Queue `capability` / `deserved` / `guarantee` parser: `pkg/scheduler/plugins/capacity/capacity.go:142-192`.
 
-### 4.13 Medium：Queue Status 与 enforcement 使用不同的启用条件和数据语义
+There is a more basic design problem: several DeviceClass selectors can match the same physical device, so an automatic total summed by DeviceClass is not necessarily additive and not necessarily unique.
 
-类型：**实现一致性问题**
+Recommendation:
 
-证据：
+- The current version should be explicit: **the root DRA capability is only what an administrator configures.**
+- Do not promise a DeviceClass total computed automatically from ResourceSlice.
+- If an automatic total is needed later, first define the rules for overlapping DeviceClasses, node-local and global devices, partitionable devices, and an incomplete ResourceSlice generation.
 
-- Queue Status 在 session close 无条件从 TaskInfo 合并 DRA：
-  `pkg/scheduler/framework/session.go:501-556`。
-- status 合并按 Claim key 去重：
-  `pkg/scheduler/framework/session_dra_queue_status.go:31-108`。
-- capacity enforcement 受 plugin arguments 控制：
-  `pkg/scheduler/plugins/capacity/capacity.go:412-430`。
-- TaskInfo 的 capacity 摘要又受全局 Kubernetes feature gate 控制：
-  `pkg/scheduler/cache/cache.go:1924-1932`。
+### 4.13 Medium: Queue Status and enforcement use different enable conditions and data semantics
 
-影响：
+Type: **implementation consistency problem**
 
-- 可能出现 status 展示 DRA usage、但 capacity plugin 没有 enforce；
-- 也可能 plugin 参数打开 consumable capacity，而全局 feature gate 关闭，导致 capacity 摘要为空并静默放行；
-- status 展示的是 Claim Spec 请求量，不是 allocation result 的实际 consumption。
+Evidence:
 
-建议：
+- Queue Status unconditionally merges DRA from TaskInfo at session close: `pkg/scheduler/framework/session.go:501-556`.
+- Status merge deduplicates by Claim key: `pkg/scheduler/framework/session_dra_queue_status.go:31-108`.
+- Capacity enforcement is controlled by plugin arguments: `pkg/scheduler/plugins/capacity/capacity.go:412-430`.
+- The TaskInfo capacity summary is also controlled by the global Kubernetes feature gate: `pkg/scheduler/cache/cache.go:1924-1932`.
 
-- 文档分别说明“观测”和“enforcement”的启用条件；
-- plugin 参数不应允许制造与全局 feature gate 相矛盾的半启用状态，至少应在 session open 明确报错；
-- Queue Status 的字段名称或文档应注明是 requested quota usage。
+Impact:
 
-## 5. 尚未定义或未覆盖的边界
+- Status can show DRA usage while the capacity plugin does not enforce it.
+- A plugin argument can enable consumable capacity while the global feature gate is off, so the capacity summary is empty and the request is allowed silently.
+- Status shows the Claim Spec request quantity, not the actual consumption in the allocation result.
 
-### 5.1 shared Claim 的计费域
+Recommendation:
 
-当前设计只说“每个 Claim 一次”，但没有回答：
+- Document the enable conditions for observation and enforcement separately.
+- A plugin argument must not create a half-enabled state that contradicts the global feature gate. At least report an error at session open.
+- The Queue Status field name or documentation should say that the value is requested quota usage.
 
-- 同一 Claim 被同一 queue 的多个 Job 引用：一次还是每个 Job 一次？
-- 同一 Claim 被两个 leaf queue 引用：每个 leaf 各一次，还是只归属一个 queue？
-- 共同祖先和 root 应计一次还是两次？
-- Claim 删除后同名重建，旧 Task 与新 Task 如何区分？
+## Boundaries That Are Undefined or Uncovered
 
-建议以 Claim UID 为 identity，并明确 leaf、ancestor、root 各自的计费域。
+### Shared Claim charging domain
 
-### 5.2 heterogeneous gang 的最小 DRA 需求
+The current design only says "once per Claim." It does not answer:
 
-没有 `TaskMinAvailable` 时，`GetMinDRAResources` 从带 DRA 的 Task 中按名字排序，取前
-`MinAvailable` 个：`pkg/scheduler/api/job_info.go:1525-1552`。
+- One Claim referenced by several Jobs in the same queue: once, or once per Job?
+- One Claim referenced by two leaf queues: once per leaf, or owned by only one queue?
+- Should a common ancestor and the root count once or twice?
+- After a Claim is deleted and recreated with the same name, how are the old Task and the new Task distinguished?
 
-如果一个 Job 同时有无 DRA Task 或不同 DRA 请求，真正能构成 gang 的 Task 组合不唯一。
-当前算法既不一定是下界，也不一定对应 scheduler 实际先调度的组合。设计需要说明：
+Use the Claim UID as the identity, and define the charging domain for leaf, ancestor, and root.
 
-- 是否要求 DRA Job 必须提供 per-task-role minAvailable；
-- 或 admission 使用保守上界；
-- 或只在实际 Task allocation 阶段 enforce，不把不确定的组合用于 Job enqueue。
+### Minimum DRA demand of a heterogeneous gang
 
-### 5.3 allocation 已存在的 Claim
+Without `TaskMinAvailable`, `GetMinDRAResources` sorts Tasks that have DRA by name and takes the first `MinAvailable` of them: `pkg/scheduler/api/job_info.go:1525-1552`.
 
-ExactCount 的 Spec 是 immutable，device count 通常可以按 Spec 记账；但 capacity 的真实消耗可能只在
-`status.allocation.devices.results[*].consumedCapacity` 中确定。设计需要说明：
+If a Job also has Tasks without DRA, or Tasks with different DRA requests, the Task combination that can actually form the gang is not unique. The current algorithm is not necessarily a lower bound, and it does not necessarily match the combination the scheduler will schedule first. The design needs to say whether:
 
-- 未分配 Claim 用 request 预留多少；
-- Reserve/PreBind 后是否 reconcile；
-- 调度回滚如何撤销；
-- scheduler restart 如何从 Claim Status 恢复。
+- a DRA Job must provide per-task-role minAvailable;
+- admission uses a conservative upper bound; or
+- enforcement happens only at actual Task allocation, and an uncertain combination is not used for Job enqueue.
 
-### 5.4 DeviceClass 重叠
+### A Claim whose allocation already exists
 
-DeviceClass 是 selector，不是 driver 或独占资源池。两个 class 可以匹配同一设备。按请求中的 class
-计逻辑 quota 是可行的，但不能把不同 class 的 quota 相加解释成物理总量。
+An ExactCount Spec is immutable, so device count can usually be accounted from the Spec. Real capacity consumption may be known only in `status.allocation.devices.results[*].consumedCapacity`. The design needs to say:
 
-### 5.5 Kubernetes v1.36 Workload ResourceClaims
+- how much an unallocated Claim reserves from its request;
+- whether Reserve and PreBind reconcile the value;
+- how scheduling rollback undoes it;
+- how a scheduler restart restores it from Claim Status.
 
-v1.36 alpha `DRAWorkloadResourceClaims` 支持 native Workload/PodGroup 级 Claim，并允许同一
-PodGroup scheduling cycle 复用 pending allocation。当前 Volcano TaskInfo 只从 Pod
-`spec.resourceClaims` 生成 quota 摘要，也没有为 capacity accounting 定义 native PodGroup Claim
-identity 和生命周期。
+### Overlapping DeviceClasses
 
-该能力可以延期，但需要列入 unsupported matrix，避免把“ResourceClaimTemplate 支持”误解为也支持
-PodGroup 级 template。
+A DeviceClass is a selector, not a driver or an exclusive resource pool. Two classes can match the same device. Charging logical quota by the class in the request is feasible. Adding quotas of different classes and calling the sum a physical total is not.
 
-### 5.6 admin access、taints、binding conditions、partitionable device
+### Kubernetes v1.36 Workload ResourceClaims
 
-- admin access 是否消耗普通 queue quota；
-- device taint/toleration 是否影响 admission 估算；
-- binding condition 长时间 pending 时 inqueue reservation 如何保持；
-- partitionable device 的 count 是 device、share 还是 allocation result 数；
+The v1.36 alpha `DRAWorkloadResourceClaims` feature supports a native Workload or PodGroup Claim and lets the same PodGroup scheduling cycle reuse a pending allocation. Current Volcano TaskInfo builds the quota summary only from Pod `spec.resourceClaims`. It also does not define a native PodGroup Claim identity and lifecycle for capacity accounting.
 
-这些都尚未定义。第一版可以延期，但应明确采用 fail-open、fail-closed 还是“不允许与 DRA quota 混用”。
+This capability can be deferred, but it must be listed in the unsupported matrix. "ResourceClaimTemplate is supported" must not be read as support for a PodGroup-level template.
 
-## 6. 哪些限制是合理的
+### Admin access, taints, binding conditions, and partitionable devices
 
-以下边界本身合理，不需要让 capacity plugin 复制 Kubernetes allocator：
+These are still undefined:
 
-- 不负责 node/device 物理放置；
-- 不解决单设备 capacity fragmentation；
-- DeviceClass quota 是 queue policy，不替代 ResourceSlice 可用性检查；
-- 第一版只支持 `Exactly + ExactCount`；
-- root total 由管理员显式配置。
+- whether admin access consumes ordinary queue quota;
+- whether device taint and toleration affect the admission estimate;
+- how an inqueue reservation is held while a binding condition stays pending for a long time;
+- whether the count of a partitionable device is a device, a share, or an allocation-result count.
 
-问题不在于范围窄，而在于当前实现对超出范围的请求静默当成 0，以及文档仍宣称完整的
-`capability/deserved/guarantee` 等价语义。
+The first version can defer them, but it must say whether the behavior is fail-open, fail-closed, or "not allowed together with DRA quota."
 
-## 7. 建议的修订方向
+## Limitations That Are Reasonable
 
-### 7.1 第一阶段：收窄并修正 hard capability
+These boundaries are reasonable. The capacity plugin does not need to copy the Kubernetes allocator:
 
-建议把第一版契约明确为：
+- It does not place devices on nodes.
+- It does not solve capacity fragmentation on a single device.
+- DeviceClass quota is queue policy. It does not replace the ResourceSlice availability check.
+- The first version supports only `Exactly + ExactCount`.
+- The root total is configured explicitly by an administrator.
 
-- 只支持 Pod 显式 ResourceClaim 和 Pod 级 ResourceClaimTemplate；
-- 只支持 `Exactly + ExactCount`；
-- count quota 为非负整数，0 表示禁止使用；
-- capacity quota 明确定义为 **raw requested capacity quota**；
-- 未配置的 capacity dimension 不限制；
-- 只承诺 `capability`，暂不承诺 DRA `deserved` / `guarantee`；
-- `FirstAvailable`、`All`、DRA Extended Resource、native Workload Claim 在配置了相关 DRA quota
-  时明确拒绝或报告 unsupported，不静默跳过；
-- root DRA capability 只接受管理员显式配置。
+The problem is not that the scope is narrow. The problem is that the current implementation silently treats an out-of-scope request as 0, and the document still claims full `capability` / `deserved` / `guarantee` equivalence.
 
-这一阶段同时修复：
+## Recommended Revision
 
-1. direct Claim informer race；
-2. shared Claim 的 Job min-resource 去重；
-3. DRA inqueue session 重建；
-4. hierarchy 按 Claim identity 重建；
-5. Queue Status 和 enforcement 的语义标注。
+### Phase 1: narrow the contract and fix hard capability
 
-### 7.2 第二阶段：再决定是否实现 DRA fair share
+Make the first-version contract explicit:
 
-只有明确需要 DRA `deserved` / `guarantee` 时再实现，至少需要统一接入：
+- Support only an explicit Pod ResourceClaim and a Pod-level ResourceClaimTemplate.
+- Support only `Exactly + ExactCount`.
+- Count quota is a non-negative integer. 0 means the queue may not use the device.
+- Define capacity quota as **raw requested capacity quota**.
+- An unconfigured capacity dimension is unlimited.
+- Promise only `capability`. Do not promise DRA `deserved` / `guarantee` yet.
+- When the related DRA quota is configured, `FirstAvailable`, `All`, DRA Extended Resource, and a native Workload Claim are rejected or reported as unsupported. They are not skipped silently.
+- Root DRA capability accepts only an administrator's explicit configuration.
 
-- queue share / order；
-- reclaim 与 preemption；
-- guarantee；
-- hierarchical deserved/guarantee；
-- allocated、request、inqueue、elastic；
-- metrics 和 Queue Status。
+This phase also fixes:
 
-不能只解析配置字段而不把 DRA usage 放进上述所有路径。
+1. the direct Claim informer race;
+2. Job minimum-resource dedup for a shared Claim;
+3. DRA inqueue rebuild across sessions;
+4. hierarchy rebuild by Claim identity;
+5. semantic labels for Queue Status and enforcement.
 
-### 7.3 第三阶段：实际 allocation-aware capacity
+### Phase 2: decide later whether to implement DRA fair share
 
-如果需求是限制 Kubernetes 实际 `ConsumedCapacity`，应复用 native DynamicResources 的 allocation
-result，而不是继续扩展 cache 中的 Spec 摘要：
+Implement DRA `deserved` / `guarantee` only when they are actually required. At a minimum, wire them together into:
 
-- Filter 之后才知道具体 device/subrequest 和 adjusted capacity；
-- Reserve/Unreserve 对应 pending allocation 生命周期；
-- PreBind 后 Claim Status 成为持久事实；
-- scheduler restart 从 allocated/pending Claim 恢复。
+- queue share and order;
+- reclaim and preemption;
+- guarantee;
+- hierarchical deserved and guarantee;
+- allocated, request, inqueue, and elastic;
+- metrics and Queue Status.
 
-这会显著扩大实现范围，应与“raw requested quota”分成独立特性。
+Parsing the configuration fields is not enough unless DRA usage is placed on every path above.
 
-## 8. 测试建议
+### Phase 3: allocation-aware capacity
 
-### 8.1 必须新增的单元测试
+If the requirement is to limit Kubernetes' actual `ConsumedCapacity`, reuse the allocation result from native DynamicResources. Do not keep extending the Spec summary in the cache:
 
-1. `FirstAvailable` 在 DRA hard quota 下不会被当成零请求；
-2. `allocationMode: All` 在 DRA hard quota 下不会被当成零请求；
-3. mixed Claim 中一个支持 request、一个 unsupported request 不会部分计费后放行；
-4. count capability=0 拒绝正数请求；
-5. 负数/小数 count capability 配置被拒绝；
-6. count-only capability 允许带 capacity request 的 Claim；
-7. 只配置某个 capacity dimension 时，未配置 dimension 不受限；
-8. direct Claim informer NotFound 后 Task 留在 cache 并能 resync；
-9. 两个 minAvailable Task 共享一个 Claim，Job enqueue 只计一次；
-10. 同一 Claim 被不同 task role 引用时仍只计一次；
-11. Inqueue DRA Job 跨两个 session 仍保留 reservation；
-12. 已部分 allocated 的 gang 不在 allocated 和 inqueue 中重复计费；
-13. parent-only DRA capability 能看见 child 的既有 allocation；
-14. 两个 child queue 共享 Claim 时，parent 按定义的计费域去重；
-15. session runtime 增量状态与下一 session 重建结果一致；
-16. Queue Status、leaf enforcement、ancestor enforcement 对同一组 Task 给出一致 usage。
+- The concrete device, subrequest, and adjusted capacity are known only after Filter.
+- Reserve and Unreserve are the pending-allocation lifecycle.
+- After PreBind, Claim Status is the durable fact.
+- A scheduler restart restores state from allocated and pending Claims.
 
-### 8.2 consumable capacity 测试
+This expands the implementation substantially. It should be a separate feature from "raw requested quota."
 
-1. request count × raw requested capacity；
-2. fully-qualified dimension 的 API/key 行为；
-3. requestPolicy rounding，明确证明 status 是 requested 还是 consumed；
-4. 未显式请求 capacity 时的默认 consumption；
-5. 一个 Claim 多个 request、多个 DeviceClass；
-6. partitionable/multi-allocation device 明确拒绝或按契约处理。
+## Test Recommendations
 
-### 8.3 E2E 缺口
+### Unit tests that must be added
 
-现有 E2E 覆盖 direct Claim、Pod 级 template、简单 shared Claim、count hard limit、capacity hard limit
-和删除后恢复，基本 happy path 是有价值的；但还需要：
+1. Under a DRA hard quota, `FirstAvailable` is not treated as a zero request.
+2. Under a DRA hard quota, `allocationMode: All` is not treated as a zero request.
+3. A mixed Claim with one supported request and one unsupported request is not partially charged and then allowed.
+4. A count capability of 0 rejects a positive request.
+5. A negative or fractional count capability is rejected.
+6. A count-only capability allows a Claim that also requests capacity.
+7. When only one capacity dimension is configured, an unconfigured dimension is unlimited.
+8. After a direct Claim informer NotFound, the Task stays in the cache and can resync.
+9. Two minAvailable Tasks share one Claim, and Job enqueue counts it once.
+10. The same Claim referenced by different task roles is still counted once.
+11. An Inqueue DRA Job keeps its reservation across two sessions.
+12. A partially allocated gang is not charged in both allocated and inqueue.
+13. A parent-only DRA capability sees the child's existing allocation.
+14. When two child queues share a Claim, the parent deduplicates according to the defined charging domain.
+15. Incremental state during a session matches the result rebuilt in the next session.
+16. Queue Status, leaf enforcement, and ancestor enforcement report the same usage for the same set of Tasks.
 
-- shared Claim 使用 `replicas=2, minAvailable=2`，避免当前测试绕过 enqueue 去重；
-- scheduler session/restart 后的 inqueue reservation；
-- hierarchical parent-only quota；
-- unsupported request 的明确失败事件；
-- queue `deserved` / `guarantee` 只有在真正实现后再增加 borrow/reclaim E2E；
-- Queue Status 检查应比较完整 DRA key 集合，而不只是
-  `queueAllocatedContains` 的子集匹配：
-  `test/e2e/dra/dra_quota_test.go:396-417`。
+### Consumable capacity tests
 
-## 9. 建议修改后的设计结论
+1. Request count multiplied by raw requested capacity.
+2. API and key behavior of a fully-qualified dimension.
+3. requestPolicy rounding, with a clear proof of whether status is requested or consumed.
+4. Default consumption when capacity is not requested explicitly.
+5. One Claim with several requests and several DeviceClasses.
+6. A partitionable or multi-allocation device is rejected explicitly or handled according to the contract.
 
-设计文档当前最需要的不是继续扩展支持列表，而是把契约改成可验证的窄闭环：
+### E2E gaps
 
-> Volcano capacity plugin 第一版为显式 Pod ResourceClaim 的
-> `Exactly + ExactCount` 提供按 DeviceClass 的 queue hard capability。
-> Consumable capacity 表示 Claim Spec 的原始请求量，不表示 Kubernetes 最终
-> `ConsumedCapacity`。未支持的 DRA 请求不会被静默视为零。
-> DRA `deserved`、`guarantee`、native Workload Claim、Extended Resource、
-> `FirstAvailable`、`All` 和 partitionable device 暂不承诺。
+Existing e2e covers a direct Claim, a Pod-level template, a simple shared Claim, a count hard limit, a capacity hard limit, and recovery after deletion. The basic happy path is useful. It still needs:
 
-先修复 hard capability、shared Claim 和 session/hierarchy 一致性，再讨论 fair share 与实际
-consumed capacity，范围最小，也最不容易形成第二套不完整的 DRA allocator。
+- a shared Claim with `replicas=2, minAvailable=2`, so the test does not bypass enqueue dedup the way the current test does;
+- inqueue reservation after a scheduler session or restart;
+- hierarchical parent-only quota;
+- an explicit failure event for an unsupported request;
+- borrow and reclaim e2e for queue `deserved` / `guarantee` only after those semantics are actually implemented;
+- a Queue Status check that compares the full DRA key set, not only the subset match of `queueAllocatedContains`: `test/e2e/dra/dra_quota_test.go:396-417`.
 
-## 10. 上游参考
+## Recommended Design Conclusion
+
+What the design document needs now is a narrow contract that can be verified, not a longer support list:
+
+> The first version of the Volcano capacity plugin provides a per-DeviceClass queue hard capability for an explicit Pod ResourceClaim that uses `Exactly + ExactCount`. Consumable capacity means the raw quantity in the Claim Spec. It does not mean Kubernetes' final `ConsumedCapacity`. An unsupported DRA request is not silently treated as zero. DRA `deserved`, `guarantee`, a native Workload Claim, Extended Resource, `FirstAvailable`, `All`, and partitionable devices are not promised yet.
+
+Fix hard capability, shared Claims, and session/hierarchy consistency before discussing fair share and actual consumed capacity. That is the smallest scope, and it is the least likely to create a second incomplete DRA allocator.
+
+## References
 
 - [Kubernetes Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
 - [Kubernetes v1.36 ResourceClaim API](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/)
