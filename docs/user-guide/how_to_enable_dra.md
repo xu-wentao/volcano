@@ -52,7 +52,9 @@ Kubernetes v1.36 introduces prioritized DRA device requests through the `FirstAv
 --feature-gates=DynamicResourceAllocation=true,DRAPrioritizedList=true
 ```
 
-Volcano uses the Kubernetes DRA score to prefer nodes that satisfy an earlier device request alternative. No additional Volcano scheduler configuration is required.
+Volcano uses the Kubernetes DRA score to prefer nodes that satisfy an earlier device request alternative. That score is a `FirstAvailable` preference. It does not bin-pack devices by utilization.
+
+`dynamicresources.weight` scales this score. The default is `1`. Set it to `0` to turn off DRA scoring only; DRA filtering, reservation, and pre-bind still run. A negative weight is rejected when the scheduler starts.
 
 ## 3. Configure Volcano Scheduler Plugins
 After installing Volcano, you need to configure the Volcano scheduler's plugin configuration to enable the DRA plugin within the predicates plugin arguments.
@@ -71,6 +73,8 @@ tiers:
   - name: predicates
     arguments:
       predicate.DynamicResourceAllocationEnable: true
+      dynamicresources.weight: 1
+      dynamicresources.filterTimeoutSeconds: 10
   - name: proportion
   - name: nodeorder
   - name: binpack

@@ -203,6 +203,14 @@ func (bp *binpackPlugin) OnSessionClose(ssn *framework.Session) {
 // Goals:
 // - Schedule Jobs using BestFit Policy using Resource Bin Packing Priority Function
 // - Reduce Fragmentation of scarce resources on the Cluster
+//
+// DRA device utilization is not part of this score. Kubernetes v1.36.1 keeps
+// Filter's per-node AllocationResult in the unexported
+// dynamicresources.stateData.nodeAllocations field. Volcano has no supported
+// read-only view of that result, so binpack.dra.weight is not implemented.
+// Native FirstAvailable scoring runs in the predicates plugin. See
+// docs/design/dra-score-design.md and
+// pkg/scheduler/plugins/util/k8s/dra_candidate_allocation.go.
 func BinPackingScore(task *api.TaskInfo, node *api.NodeInfo, weight priorityWeight) float64 {
 	score := 0.0
 	weightSum := 0

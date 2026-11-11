@@ -631,9 +631,14 @@ func (pp *PredicatesPlugin) InitPlugin() {
 		addScorePlugin(volumebinding.Name, volumeBindingPluginInstance, vbArgs.Weight)
 	}
 	// 10. DRA
+	// The same DynamicResources instance serves Filter and Score so both read
+	// the CycleState written by PreFilter/Filter. Native Score is FirstAvailable
+	// preference, not device-utilization binpack.
 	if pp.enabledPredicates.dynamicResourceAllocationEnable {
 		draArgs := defaultDynamicResourcesArgs()
-		setUpDynamicResourcesArgs(draArgs, pp.pluginArguments)
+		if err := setUpDynamicResourcesArgs(draArgs, pp.pluginArguments); err != nil {
+			klog.Fatalf("invalid arguments for %s: %v", dynamicresources.Name, err)
+		}
 		plugin, err := dynamicresources.New(context.TODO(), draArgs.DynamicResourcesArgs, pp.Handle, pp.features)
 		if err != nil {
 			klog.Fatalf("failed to create dra plugin with err: %v", err)
@@ -643,7 +648,12 @@ func (pp *PredicatesPlugin) InitPlugin() {
 		addPreFilterPlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
 		addReservePlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
 		addPreBindPlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
-		addScorePlugin(dynamicresources.Name, dynamicResourceAllocationPlugin, 1)
+		// Weight 0 disables Score only. Filter, Reserve and PreBind stay enabled.
+		if draArgs.Weight > 0 {
+			addScorePlugin(dynamicresources.Name, dynamicResourceAllocationPlugin, draArgs.Weight)
+		} else {
+			klog.V(3).Infof("%s score is disabled because %s is 0", dynamicresources.Name, draScoreWeightKey)
+		}
 	}
 
 	pp.FilterPlugins = filterPlugins
